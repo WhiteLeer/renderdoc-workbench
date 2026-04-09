@@ -5,6 +5,7 @@
 - 服务脚本：`mcp/renderdoc_mcp_server.py`
 - 启动脚本：`start_renderdoc_mcp.bat`
 - 工具名：`capture_game`
+- 工具名：`analyze_rdc`
 
 ## 模式
 
@@ -74,6 +75,22 @@
   "open_in_qrenderdoc": true
 }
 ```
+
+`analyze_rdc`（分析已有 rdc）：
+
+```json
+{
+  "rdc_path": "C:\\Users\\wepie\\Desktop\\RenderDoc-mcp\\captures\\sample.rdc",
+  "top_n": 12,
+  "save_json": true
+}
+```
+
+返回内容包含：
+- 流程统计：事件数、Draw 数、RenderPass 数、Present 事件
+- 热点：按 GPU Duration 排序的 Top DrawCall
+- 贴图/资源：纹理使用统计（可用时）与热点事件绑定资源
+- 管线追踪：热点事件的 VS/PS、采样输入、输出目标
 
 ## 提示
 

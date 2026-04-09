@@ -219,7 +219,36 @@ def _tool_definitions() -> List[Dict[str, Any]]:
                 "required": [],
                 "additionalProperties": False,
             },
-        }
+        },
+        {
+            "name": "analyze_rdc",
+            "description": "Analyze a RenderDoc .rdc capture and return render-flow, texture usage and hotspot summary.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rdc_path": {
+                        "type": "string",
+                        "description": "Absolute path to .rdc file.",
+                    },
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Top-N rows for hotspots/textures/pipeline traces.",
+                        "default": 12,
+                    },
+                    "renderdoc_dir": {
+                        "type": "string",
+                        "description": "Directory containing qrenderdoc.exe. Defaults to script parent root.",
+                    },
+                    "save_json": {
+                        "type": "boolean",
+                        "description": "Whether to persist detailed json file next to rdc.",
+                        "default": True,
+                    },
+                },
+                "required": ["rdc_path"],
+                "additionalProperties": False,
+            },
+        },
     ]
 
 
@@ -570,6 +599,313 @@ with open(result_path, "w", encoding="utf-8") as f:
     elif not details.get("error"):
         details["error"] = "qrenderdoc result file not produced"
     return details
+
+
+def _analyze_rdc_with_qrenderdoc(
+    qrenderdoc: Path,
+    rdc_path: Path,
+    top_n: int = 12,
+    save_json: bool = True,
+) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "rdc_path": str(rdc_path),
+        "open_ok": False,
+        "pipeline": None,
+        "flow": {},
+        "hotspots": {},
+        "textures": {},
+        "pipeline_trace": [],
+        "algorithms": {},
+        "errors": [],
+        "analysis_json": None,
+    }
+    if not qrenderdoc.exists():
+        raise ValueError(f"qrenderdoc.exe not found: {qrenderdoc}")
+    if not rdc_path.exists():
+        raise ValueError(f"rdc_path not found: {rdc_path}")
+    if rdc_path.suffix.lower() != ".rdc":
+        raise ValueError(f"rdc_path must be .rdc: {rdc_path}")
+
+    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_mcp_analyze_"))
+    script_path = run_dir / "analyze_rdc.py"
+    result_path = run_dir / "analyze_result.json"
+    log_path = run_dir / "analyze.log"
+    top_n = max(int(top_n), 1)
+
+    output_json = rdc_path.with_suffix(".analysis.json")
+    cfg = {
+        "rdc_path": str(rdc_path),
+        "result_path": str(result_path),
+        "log_path": str(log_path),
+        "top_n": top_n,
+        "persist_output_path": str(output_json) if save_json else "",
+    }
+    cfg_json = json.dumps(cfg, ensure_ascii=True)
+    script = f"""import json
+import traceback
+import time
+
+cfg = json.loads({json.dumps(cfg_json)})
+rdc_path = cfg["rdc_path"]
+result_path = cfg["result_path"]
+log_path = cfg["log_path"]
+top_n = int(cfg["top_n"])
+persist_output_path = cfg["persist_output_path"]
+
+def _log(msg):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"[{{time.strftime('%H:%M:%S')}}] {{msg}}\\n")
+
+res = {{
+    "rdc_path": rdc_path,
+    "open_ok": False,
+    "pipeline": None,
+    "flow": {{}},
+    "hotspots": {{}},
+    "textures": {{}},
+    "pipeline_trace": [],
+    "algorithms": {{}},
+    "errors": [],
+}}
+
+try:
+    import renderdoc as rd
+
+    cap = rd.OpenCaptureFile()
+    st = cap.OpenFile(rdc_path, "", None)
+    if st != rd.ResultCode.Succeeded:
+        raise RuntimeError(f"OpenFile failed: {{st}}")
+
+    st2, ctrl = cap.OpenCapture(rd.ReplayOptions(), None)
+    if st2 != rd.ResultCode.Succeeded:
+        raise RuntimeError(f"OpenCapture failed: {{st2}}")
+    res["open_ok"] = True
+    res["pipeline"] = str(ctrl.GetAPIProperties().pipelineType)
+
+    rmap = {{}}
+    for r in ctrl.GetResources():
+        rmap[str(r.resourceId)] = str(r.name)
+
+    roots = list(ctrl.GetRootActions())
+    queue = roots[:]
+    actions = []
+    draw_ids = []
+    begin_pass = 0
+    end_pass = 0
+    present_ids = []
+    while queue:
+        a = queue.pop(0)
+        flags = a.flags
+        name = ""
+        try:
+            name = str(a.customName)
+        except Exception:
+            name = ""
+        if not name:
+            try:
+                name = str(a.GetName(ctrl.GetStructuredFile()))
+            except Exception:
+                name = ""
+        one = {{
+            "eventId": int(a.eventId),
+            "flags": str(flags),
+            "name": name,
+            "numIndices": int(getattr(a, "numIndices", 0)),
+            "numInstances": int(getattr(a, "numInstances", 0)),
+        }}
+        actions.append(one)
+        if (flags & rd.ActionFlags.Drawcall) != 0:
+            draw_ids.append(int(a.eventId))
+        if (flags & rd.ActionFlags.BeginPass) != 0:
+            begin_pass += 1
+        if (flags & rd.ActionFlags.EndPass) != 0:
+            end_pass += 1
+        if (flags & rd.ActionFlags.Present) != 0:
+            present_ids.append(int(a.eventId))
+        for c in a.children:
+            queue.append(c)
+
+    res["flow"] = {{
+        "eventCount": len(actions),
+        "drawCount": len(draw_ids),
+        "beginPassCount": begin_pass,
+        "endPassCount": end_pass,
+        "presentEventIds": present_ids,
+    }}
+
+    # pass segmentation
+    pass_segments = []
+    stack = []
+    for a in actions:
+        f = a["flags"]
+        if "BeginPass" in f:
+            stack.append({{"beginEvent": a["eventId"], "beginName": a["name"], "draws": 0}})
+        elif "EndPass" in f and stack:
+            seg = stack.pop()
+            seg["endEvent"] = a["eventId"]
+            seg["endName"] = a["name"]
+            pass_segments.append(seg)
+        elif "Drawcall" in f and stack:
+            stack[-1]["draws"] += 1
+    pass_segments.sort(key=lambda x: x.get("draws", 0), reverse=True)
+    res["flow"]["topPassesByDraws"] = pass_segments[:top_n]
+
+    # GPU duration hotspots
+    gpu_counter = None
+    for c in ctrl.EnumerateCounters():
+        d = ctrl.DescribeCounter(c)
+        if str(d.name) == "GPU Duration":
+            gpu_counter = c
+            break
+    hotspot_rows = []
+    if gpu_counter is not None:
+        vals = ctrl.FetchCounters([gpu_counter])
+        duration_by_event = {{}}
+        for v in vals:
+            eid = int(v.eventId)
+            if eid not in draw_ids:
+                continue
+            dur = 0.0
+            try:
+                dur = float(v.value.d)
+            except Exception:
+                try:
+                    dur = float(v.value.u)
+                except Exception:
+                    dur = 0.0
+            duration_by_event[eid] = dur
+        for a in actions:
+            eid = a["eventId"]
+            if eid in duration_by_event:
+                hotspot_rows.append({{
+                    "eventId": eid,
+                    "name": a["name"],
+                    "gpuDuration_us": round(duration_by_event[eid] * 1e6, 3),
+                    "numIndices": a["numIndices"],
+                    "numInstances": a["numInstances"],
+                }})
+    hotspot_rows.sort(key=lambda x: x.get("gpuDuration_us", 0), reverse=True)
+    res["hotspots"] = {{
+        "topByGpuDuration": hotspot_rows[:top_n]
+    }}
+
+    # texture usage by usage count
+    tex_rows = []
+    for t in ctrl.GetTextures():
+        try:
+            u = ctrl.GetUsage(t.resourceId)
+            c = len(u)
+            if c <= 0:
+                continue
+            tex_rows.append({{
+                "resourceId": str(t.resourceId),
+                "name": rmap.get(str(t.resourceId), str(t.name)),
+                "usageCount": c,
+                "width": int(t.width),
+                "height": int(t.height),
+                "format": str(t.format),
+            }})
+        except Exception:
+            continue
+    tex_rows.sort(key=lambda x: x.get("usageCount", 0), reverse=True)
+    res["textures"] = {{
+        "totalTextures": len(ctrl.GetTextures()),
+        "topByUsageCount": tex_rows[:top_n],
+    }}
+
+    # pipeline trace for top gpu events
+    trace_rows = []
+    top_event_ids = [x["eventId"] for x in hotspot_rows[:top_n]]
+    for eid in top_event_ids:
+        try:
+            ctrl.SetFrameEvent(eid, True)
+            p = ctrl.GetPipelineState()
+            row = {{
+                "eventId": eid,
+                "vs": {{
+                    "id": str(p.GetShader(rd.ShaderStage.Vertex)),
+                    "entry": str(p.GetShaderEntryPoint(rd.ShaderStage.Vertex)),
+                }},
+                "ps": {{
+                    "id": str(p.GetShader(rd.ShaderStage.Pixel)),
+                    "entry": str(p.GetShaderEntryPoint(rd.ShaderStage.Pixel)),
+                }},
+                "psSampledResources": [],
+                "outputTargets": [],
+            }}
+            for u in p.GetReadOnlyResources(rd.ShaderStage.Pixel):
+                rid = str(u.descriptor.resource)
+                row["psSampledResources"].append({{
+                    "resourceId": rid,
+                    "name": rmap.get(rid, ""),
+                    "slot": int(u.access.index),
+                }})
+            for d in p.GetOutputTargets():
+                rid = str(d.resource)
+                row["outputTargets"].append({{
+                    "resourceId": rid,
+                    "name": rmap.get(rid, ""),
+                }})
+            trace_rows.append(row)
+        except Exception as e:
+            res["errors"].append(f"trace event {{eid}}: {{e}}")
+    res["pipeline_trace"] = trace_rows
+
+    hints = []
+    names = [a["name"].lower() for a in actions]
+    if any("drawindexed" in n for n in names):
+        hints.append("classic raster forward/deferred draw path")
+    if any("copybuffertoimage" in n for n in names):
+        hints.append("buffer-to-image upload stage observed")
+    if not any("dispatch" in n for n in names):
+        hints.append("no explicit compute dispatch in this frame")
+    if begin_pass >= 20:
+        hints.append("many render passes, likely composition/post-processing chain")
+    res["algorithms"] = {{"hints": hints}}
+
+    ctrl.Shutdown()
+    cap.Shutdown()
+except Exception:
+    res["errors"].append(traceback.format_exc())
+
+with open(result_path, "w", encoding="utf-8") as f:
+    json.dump(res, f, ensure_ascii=False, indent=2)
+if persist_output_path:
+    with open(persist_output_path, "w", encoding="utf-8") as f:
+        json.dump(res, f, ensure_ascii=False, indent=2)
+"""
+    script_path.write_text(script, encoding="utf-8")
+
+    proc = subprocess.Popen(
+        [str(qrenderdoc), "--python", str(script_path)],
+        cwd=str(qrenderdoc.parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        if result_path.exists():
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    if result_path.exists():
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+        result.update(payload)
+    else:
+        result["errors"].append("analyze result file not produced")
+
+    if save_json:
+        result["analysis_json"] = str(output_json)
+    return result
 
 
 def _find_pid_by_name(process_name: str) -> Optional[int]:
@@ -957,6 +1293,23 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
+def _analyze_rdc(args: Dict[str, Any]) -> Dict[str, Any]:
+    rdc_path_arg = args.get("rdc_path")
+    if not rdc_path_arg:
+        raise ValueError("rdc_path is required")
+    rdc_path = Path(str(rdc_path_arg)).expanduser().resolve()
+    top_n = int(args.get("top_n", 12))
+    save_json = bool(args.get("save_json", True))
+    _renderdoccmd, qrenderdoc = _resolve_renderdoc_paths(args.get("renderdoc_dir"))
+    data = _analyze_rdc_with_qrenderdoc(
+        qrenderdoc=qrenderdoc,
+        rdc_path=rdc_path,
+        top_n=top_n,
+        save_json=save_json,
+    )
+    return data
+
+
 def _text_result(data: Dict[str, Any], is_error: bool = False) -> Dict[str, Any]:
     return {
         "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}],
@@ -996,9 +1349,12 @@ def main() -> None:
             elif method == "tools/call":
                 name = params.get("name")
                 arguments = params.get("arguments", {})
-                if name != "capture_game":
+                if name == "capture_game":
+                    data = _capture_game(arguments)
+                elif name == "analyze_rdc":
+                    data = _analyze_rdc(arguments)
+                else:
                     raise ValueError(f"Unknown tool: {name}")
-                data = _capture_game(arguments)
                 if wants_response:
                     _send_response(req_id, _text_result(data, is_error=False))
             elif method in ("notifications/initialized", "ping"):
