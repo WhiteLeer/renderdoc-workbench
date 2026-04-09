@@ -3,9 +3,11 @@ import ctypes
 import glob
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
@@ -16,6 +18,13 @@ SERVER_NAME = "renderdoc-mcp"
 SERVER_VERSION = "0.1.0"
 VK_F12 = 0x7B
 KEYEVENTF_KEYUP = 0x0002
+
+
+class _RdcStr(ctypes.Structure):
+    _fields_ = [("a", ctypes.c_uint64), ("b", ctypes.c_uint64), ("c", ctypes.c_uint64)]
+
+
+_RDCSTR_FIXED_STATE = 1 << 63
 
 
 def _send_response(req_id: Any, result: Dict[str, Any]) -> None:
@@ -65,13 +74,39 @@ def _tool_definitions() -> List[Dict[str, Any]]:
                     },
                     "auto_trigger": {
                         "type": "boolean",
-                        "description": "Whether to auto-send F12 to trigger capture.",
+                        "description": "Whether to auto-trigger a frame capture.",
                         "default": True,
+                    },
+                    "trigger_backend": {
+                        "type": "string",
+                        "enum": ["auto", "qrenderdoc", "targetcontrol", "hotkey"],
+                        "description": "auto: for MuMu prefer qrenderdoc python trigger, otherwise targetcontrol, fallback hotkey only if allowed.",
+                        "default": "auto",
                     },
                     "trigger_delay_sec": {
                         "type": "number",
                         "description": "Delay before auto-triggering F12.",
                         "default": 5,
+                    },
+                    "allow_focus_hotkey": {
+                        "type": "boolean",
+                        "description": "Allow focusing a window and sending F12 as fallback.",
+                        "default": False,
+                    },
+                    "cycle_active_window_count": {
+                        "type": "integer",
+                        "description": "How many times to call TargetControl.CycleActiveWindow before trigger.",
+                        "default": 0,
+                    },
+                    "qrenderdoc_trigger_count": {
+                        "type": "integer",
+                        "description": "How many TriggerCapture calls to send in qrenderdoc backend.",
+                        "default": 8,
+                    },
+                    "qrenderdoc_poll_timeout_sec": {
+                        "type": "number",
+                        "description": "How long qrenderdoc backend polls for NewCapture messages.",
+                        "default": 45,
                     },
                     "wait_for_exit": {
                         "type": "boolean",
@@ -266,6 +301,277 @@ def _send_f12() -> None:
     user32.keybd_event(VK_F12, 0, KEYEVENTF_KEYUP, 0)
 
 
+def _make_rdcstr(text: str) -> Tuple[_RdcStr, Any]:
+    encoded = text.encode("utf-8")
+    buf = ctypes.create_string_buffer(encoded + b"\x00")
+    val = _RdcStr(ctypes.addressof(buf), len(encoded), _RDCSTR_FIXED_STATE)
+    return val, buf
+
+
+def _extract_inject_ident(return_code: Optional[int], stdout: str, stderr: str) -> Optional[int]:
+    merged = (stdout or "") + "\n" + (stderr or "")
+    m = re.search(r"Launched as ID\s+(\d+)", merged)
+    if m:
+        return int(m.group(1))
+    if return_code is not None and return_code > 0 and "Injecting into PID" in merged:
+        return int(return_code)
+    return None
+
+
+def _targetcontrol_trigger(
+    renderdoc_dll: Path,
+    ident: int,
+    trigger_frames: int,
+    cycle_active_window_count: int,
+    client_name: str,
+) -> Dict[str, Any]:
+    details: Dict[str, Any] = {
+        "attempted": True,
+        "ident": ident,
+        "connected": False,
+        "target_pid": None,
+        "triggered": False,
+        "error": None,
+    }
+    try:
+        lib = ctypes.WinDLL(str(renderdoc_dll))
+        create = lib.RENDERDOC_CreateTargetControl
+        create.argtypes = [
+            ctypes.POINTER(_RdcStr),
+            ctypes.c_uint32,
+            ctypes.POINTER(_RdcStr),
+            ctypes.c_bool,
+        ]
+        create.restype = ctypes.c_void_p
+
+        url, url_buf = _make_rdcstr("")
+        client, client_buf = _make_rdcstr(client_name)
+        target_ptr = create(ctypes.byref(url), int(ident), ctypes.byref(client), True)
+
+        # Keep references alive until we're done.
+        _ = (url_buf, client_buf)
+
+        if not target_ptr:
+            details["error"] = "RENDERDOC_CreateTargetControl returned null"
+            return details
+
+        vtable = ctypes.cast(
+            target_ptr, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        ).contents
+
+        shutdown = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(vtable[0])
+        connected = ctypes.CFUNCTYPE(ctypes.c_bool, ctypes.c_void_p)(vtable[1])
+        getpid = ctypes.CFUNCTYPE(ctypes.c_uint32, ctypes.c_void_p)(vtable[4])
+        trigger = ctypes.CFUNCTYPE(None, ctypes.c_void_p, ctypes.c_uint32)(vtable[6])
+        cycle = ctypes.CFUNCTYPE(None, ctypes.c_void_p)(vtable[11])
+
+        details["connected"] = bool(connected(target_ptr))
+        details["target_pid"] = int(getpid(target_ptr))
+
+        if details["connected"]:
+            for _idx in range(max(cycle_active_window_count, 0)):
+                cycle(target_ptr)
+                time.sleep(0.1)
+            trigger(target_ptr, max(int(trigger_frames), 1))
+            details["triggered"] = True
+
+        shutdown(target_ptr)
+        return details
+    except Exception as exc:
+        details["error"] = str(exc)
+        return details
+
+
+def _qrenderdoc_python_trigger(
+    qrenderdoc: Path,
+    target_process_name: str,
+    capture_output: Path,
+    trigger_count: int,
+    poll_timeout_sec: float,
+    trigger_delay_sec: float,
+) -> Dict[str, Any]:
+    details: Dict[str, Any] = {
+        "attempted": True,
+        "backend": "qrenderdoc",
+        "target_process_name": target_process_name,
+        "triggered": False,
+        "copied_count": 0,
+        "copied_files": [],
+        "target_ident": None,
+        "target_pid": None,
+        "target_api": "",
+        "log_path": None,
+        "error": None,
+    }
+    if not qrenderdoc.exists():
+        details["error"] = f"qrenderdoc.exe not found: {qrenderdoc}"
+        return details
+
+    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_mcp_qrd_"))
+    script_path = run_dir / "qrd_trigger.py"
+    result_path = run_dir / "qrd_result.json"
+    log_path = run_dir / "qrd_trigger.log"
+    details["log_path"] = str(log_path)
+
+    config = {
+        "target_name": target_process_name,
+        "output_dir": str(capture_output.parent),
+        "output_stem": capture_output.stem,
+        "trigger_count": max(int(trigger_count), 1),
+        "poll_timeout_sec": max(float(poll_timeout_sec), 1.0),
+        "trigger_delay_sec": max(float(trigger_delay_sec), 0.0),
+        "result_path": str(result_path),
+        "log_path": str(log_path),
+    }
+    config_json = json.dumps(config, ensure_ascii=True)
+
+    script = f"""import json
+import os
+import time
+import traceback
+
+cfg = json.loads({json.dumps(config_json)})
+target_name = str(cfg["target_name"]).lower()
+output_dir = cfg["output_dir"]
+output_stem = cfg["output_stem"]
+trigger_count = int(cfg["trigger_count"])
+poll_timeout_sec = float(cfg["poll_timeout_sec"])
+trigger_delay_sec = float(cfg["trigger_delay_sec"])
+result_path = cfg["result_path"]
+log_path = cfg["log_path"]
+
+def _log(msg):
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(f"[{{time.strftime('%H:%M:%S')}}] {{msg}}\\n")
+
+result = {{
+    "triggered": False,
+    "copied_files": [],
+    "target_ident": None,
+    "target_pid": None,
+    "target_api": "",
+    "error": None,
+}}
+
+try:
+    import renderdoc as rd
+    ids = []
+    cur = 0
+    for _ in range(256):
+        nxt = rd.EnumerateRemoteTargets("", cur)
+        if nxt == 0:
+            break
+        ids.append(nxt)
+        cur = nxt
+    _log(f"targets: {{ids}}")
+
+    target = None
+    for ident in ids:
+        try:
+            t = rd.CreateTargetControl("", ident, "renderdoc-mcp-qrd", True)
+            if t is None:
+                continue
+            tgt = str(t.GetTarget())
+            pid = int(t.GetPID())
+            api = str(t.GetAPI())
+            _log(f"ident={{ident}} target={{tgt}} pid={{pid}} api={{api}} connected={{t.Connected()}}")
+            if t.Connected() and tgt.lower() == target_name:
+                target = t
+                result["target_ident"] = ident
+                result["target_pid"] = pid
+                result["target_api"] = api
+                break
+            t.Shutdown()
+        except Exception as e:
+            _log(f"probe ident={{ident}} error: {{e}}")
+
+    if target is None:
+        raise RuntimeError(f"target '{{cfg['target_name']}}' not found in target control list")
+
+    if trigger_delay_sec > 0:
+        time.sleep(trigger_delay_sec)
+    for _ in range(3):
+        target.CycleActiveWindow()
+        time.sleep(0.1)
+
+    for i in range(trigger_count):
+        target.TriggerCapture(1)
+        _log(f"trigger #{{i+1}}")
+        time.sleep(1.0)
+    result["triggered"] = True
+
+    deadline = time.time() + poll_timeout_sec
+    while time.time() < deadline:
+        msg = target.ReceiveMessage(None)
+        if msg.type == rd.TargetControlMessageType.NewCapture:
+            cap = msg.newCapture
+            local = os.path.join(output_dir, f"{{output_stem}}_qrd_{{int(time.time())}}_{{cap.captureId}}.rdc")
+            target.CopyCapture(cap.captureId, local)
+            result["copied_files"].append(local)
+            _log(f"new capture id={{cap.captureId}} remote={{cap.path}} local={{local}}")
+        time.sleep(0.1)
+
+    target.Shutdown()
+except Exception:
+    result["error"] = traceback.format_exc()
+    _log(result["error"])
+
+with open(result_path, "w", encoding="utf-8") as f:
+    json.dump(result, f, ensure_ascii=False, indent=2)
+"""
+    script_path.write_text(script, encoding="utf-8")
+
+    proc = subprocess.Popen(
+        [str(qrenderdoc), "--python", str(script_path)],
+        cwd=str(qrenderdoc.parent),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    wait_timeout = max(int(poll_timeout_sec + trigger_count + trigger_delay_sec + 25), 30)
+    deadline = time.time() + wait_timeout
+    while time.time() < deadline:
+        if result_path.exists():
+            break
+        if proc.poll() is not None:
+            break
+        time.sleep(0.2)
+
+    if proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+
+    out, err = "", ""
+    if proc.stdout:
+        out = proc.stdout.read()
+    if proc.stderr:
+        err = proc.stderr.read()
+    details["process_return_code"] = proc.returncode
+    details["stdout"] = (out or "").strip()
+    details["stderr"] = (err or "").strip()
+
+    if result_path.exists():
+        try:
+            payload = json.loads(result_path.read_text(encoding="utf-8"))
+            details["triggered"] = bool(payload.get("triggered"))
+            copied = payload.get("copied_files", [])
+            details["copied_files"] = copied
+            details["copied_count"] = len(copied)
+            details["target_ident"] = payload.get("target_ident")
+            details["target_pid"] = payload.get("target_pid")
+            details["target_api"] = payload.get("target_api", "")
+            if payload.get("error"):
+                details["error"] = payload.get("error")
+        except Exception as exc:
+            details["error"] = f"failed to parse qrenderdoc result: {exc}"
+    elif not details.get("error"):
+        details["error"] = "qrenderdoc result file not produced"
+    return details
+
+
 def _find_pid_by_name(process_name: str) -> Optional[int]:
     name = process_name.lower()
     try:
@@ -381,7 +687,12 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
         else _default_capture_path(game_path if game_path else Path("attached_process.exe"))
     )
     auto_trigger = bool(args.get("auto_trigger", True))
+    trigger_backend = str(args.get("trigger_backend", "auto")).lower()
     trigger_delay_sec = float(args.get("trigger_delay_sec", 5))
+    allow_focus_hotkey = bool(args.get("allow_focus_hotkey", False))
+    cycle_active_window_count = int(args.get("cycle_active_window_count", 0))
+    qrenderdoc_trigger_count = int(args.get("qrenderdoc_trigger_count", 8))
+    qrenderdoc_poll_timeout_sec = float(args.get("qrenderdoc_poll_timeout_sec", 45))
     wait_for_exit = bool(args.get("wait_for_exit", False))
     open_in_qrenderdoc = bool(args.get("open_in_qrenderdoc", False))
     timeout_sec = float(args.get("timeout_sec", 60))
@@ -524,24 +835,6 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
                 "stderr": "MuMuVMMHeadless.exe not found for second stage attach",
             }
 
-    trigger_note = "auto_trigger disabled"
-    if auto_trigger:
-        time.sleep(max(trigger_delay_sec, 0))
-        focus_name = None
-        if capture_mode == "launch" and game_path:
-            focus_name = game_path.name
-        elif args.get("focus_process_name"):
-            focus_name = str(args["focus_process_name"])
-        elif emulator_profile == "mumu":
-            focus_name = "MuMuNxDevice.exe"
-        elif args.get("target_process_name"):
-            focus_name = str(args["target_process_name"])
-        focused = _set_foreground_for_process_name(focus_name) if focus_name else False
-        _send_f12()
-        trigger_note = (
-            f"sent F12 after {trigger_delay_sec}s; foreground_found={focused}"
-        )
-
     if wait_for_exit:
         stdout, stderr = proc.communicate(timeout=max(timeout_sec, 1))
     else:
@@ -549,6 +842,84 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
             stdout, stderr = proc.communicate(timeout=max(timeout_sec, 1))
         except subprocess.TimeoutExpired:
             stdout, stderr = "", ""
+
+    trigger_note = "auto_trigger disabled"
+    trigger_details: Dict[str, Any] = {"attempted": False}
+    if auto_trigger:
+        selected_backend = trigger_backend
+        if selected_backend == "auto":
+            selected_backend = "qrenderdoc" if emulator_profile == "mumu" else "targetcontrol"
+
+        if selected_backend == "qrenderdoc":
+            target_name_for_qrd = "MuMuVMMHeadless"
+            trigger_details = _qrenderdoc_python_trigger(
+                qrenderdoc=qrenderdoc,
+                target_process_name=target_name_for_qrd,
+                capture_output=capture_output,
+                trigger_count=qrenderdoc_trigger_count,
+                poll_timeout_sec=qrenderdoc_poll_timeout_sec,
+                trigger_delay_sec=trigger_delay_sec,
+            )
+            if trigger_details.get("copied_count", 0) > 0:
+                trigger_note = (
+                    f"qrenderdoc trigger succeeded; copied={trigger_details.get('copied_count')} "
+                    f"target={target_name_for_qrd}"
+                )
+            else:
+                trigger_note = (
+                    f"qrenderdoc trigger finished without captures; error={trigger_details.get('error')}"
+                )
+
+        time.sleep(max(trigger_delay_sec, 0) if selected_backend != "qrenderdoc" else 0)
+        ident = _extract_inject_ident(proc.returncode, stdout, stderr)
+        use_target_control = selected_backend == "targetcontrol"
+        if use_target_control and ident is not None:
+            renderdoc_dll = renderdoccmd.parent / "renderdoc.dll"
+            if renderdoc_dll.exists():
+                trigger_details = _targetcontrol_trigger(
+                    renderdoc_dll=renderdoc_dll,
+                    ident=ident,
+                    trigger_frames=1,
+                    cycle_active_window_count=cycle_active_window_count,
+                    client_name="renderdoc-mcp",
+                )
+                if trigger_details.get("triggered"):
+                    trigger_note = (
+                        f"targetcontrol TriggerCapture(1) after {trigger_delay_sec}s; "
+                        f"ident={ident}; connected={trigger_details.get('connected')}"
+                    )
+                else:
+                    trigger_note = (
+                        f"targetcontrol failed after {trigger_delay_sec}s; "
+                        f"ident={ident}; error={trigger_details.get('error')}"
+                    )
+            else:
+                trigger_note = f"targetcontrol skipped: renderdoc.dll not found at {renderdoc_dll}"
+
+        if (
+            not trigger_details.get("triggered")
+            and selected_backend == "hotkey"
+            and allow_focus_hotkey
+        ):
+            focus_name = None
+            if capture_mode == "launch" and game_path:
+                focus_name = game_path.name
+            elif args.get("focus_process_name"):
+                focus_name = str(args["focus_process_name"])
+            elif emulator_profile == "mumu":
+                focus_name = "MuMuNxDevice.exe"
+            elif args.get("target_process_name"):
+                focus_name = str(args["target_process_name"])
+            focused = _set_foreground_for_process_name(focus_name) if focus_name else False
+            _send_f12()
+            trigger_details = {"attempted": True, "backend": "hotkey", "focused": focused}
+            trigger_note = (
+                f"sent F12 after {trigger_delay_sec}s; foreground_found={focused}"
+            )
+        elif not trigger_details.get("triggered") and selected_backend == "hotkey":
+            trigger_note = (
+                f"{trigger_note}; hotkey fallback skipped (allow_focus_hotkey=false)"
+            )
 
     latest = _latest_capture(capture_output)
     temp_collected_from = None
@@ -576,6 +947,7 @@ def _capture_game(args: Dict[str, Any]) -> Dict[str, Any]:
         "return_code": proc.returncode,
         "second_stage": second_stage,
         "trigger_note": trigger_note,
+        "trigger_details": trigger_details,
         "capture_template": str(capture_output),
         "latest_capture": str(latest) if latest else None,
         "temp_collected_from": temp_collected_from,

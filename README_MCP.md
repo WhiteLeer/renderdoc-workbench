@@ -23,6 +23,13 @@
 - `disallow_fullscreen`：默认 `true`，减少独占全屏导致的抓取失败
 - `trigger_delay_sec`：默认 `5`，建议本体游戏设 `8-15`
 - `delay_for_debugger_sec`：RenderDoc 注入后额外等待秒数
+- `trigger_backend`：`auto` / `qrenderdoc` / `targetcontrol` / `hotkey`
+  - `auto`：MuMu 默认走 `qrenderdoc` Python 触发（稳定拿到 `NewCapture`）
+  - `qrenderdoc`：显式使用 qrenderdoc Python API 触发并复制 capture
+  - `targetcontrol`：直接走低层 TargetControl 触发
+  - `hotkey`：窗口置前后发送 F12（需 `allow_focus_hotkey=true`）
+- `qrenderdoc_trigger_count`：qrenderdoc 模式触发次数，默认 `8`
+- `qrenderdoc_poll_timeout_sec`：qrenderdoc 模式轮询 `NewCapture` 的超时秒数，默认 `45`
 
 ## MCP 配置示例
 
