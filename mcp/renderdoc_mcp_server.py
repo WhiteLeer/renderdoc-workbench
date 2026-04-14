@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import ctypes
 import glob
+import importlib.util
 import json
+import hashlib
 import os
 import re
 import shutil
@@ -14,11 +16,71 @@ from html import escape
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    import integration
+except Exception:
+    integration = None
+    try:
+        _integration_path = Path(__file__).resolve().parent / "integration.py"
+        if _integration_path.exists():
+            _s = importlib.util.spec_from_file_location("integration", str(_integration_path))
+            if _s and _s.loader:
+                _m = importlib.util.module_from_spec(_s)
+                _s.loader.exec_module(_m)
+                integration = _m
+    except Exception:
+        integration = None
+try:
+    import analysis_entry_tools
+except Exception:
+    analysis_entry_tools = None
+    try:
+        _analysis_entry_path = Path(__file__).resolve().parent / "analysis_entry_tools.py"
+        if _analysis_entry_path.exists():
+            _sa = importlib.util.spec_from_file_location("analysis_entry_tools", str(_analysis_entry_path))
+            if _sa and _sa.loader:
+                _ma = importlib.util.module_from_spec(_sa)
+                _sa.loader.exec_module(_ma)
+                analysis_entry_tools = _ma
+    except Exception:
+        analysis_entry_tools = None
+try:
+    import capture_entry_tools
+except Exception:
+    capture_entry_tools = None
+    try:
+        _capture_entry_path = Path(__file__).resolve().parent / "capture_entry_tools.py"
+        if _capture_entry_path.exists():
+            _sc = importlib.util.spec_from_file_location("capture_entry_tools", str(_capture_entry_path))
+            if _sc and _sc.loader:
+                _mc = importlib.util.module_from_spec(_sc)
+                _sc.loader.exec_module(_mc)
+                capture_entry_tools = _mc
+    except Exception:
+        capture_entry_tools = None
+try:
+    import server_runtime
+except Exception:
+    server_runtime = None
+    try:
+        _runtime_path = Path(__file__).resolve().parent / "server_runtime.py"
+        if _runtime_path.exists():
+            _s2 = importlib.util.spec_from_file_location("server_runtime", str(_runtime_path))
+            if _s2 and _s2.loader:
+                _m2 = importlib.util.module_from_spec(_s2)
+                _s2.loader.exec_module(_m2)
+                server_runtime = _m2
+    except Exception:
+        server_runtime = None
+
 
 SERVER_NAME = "renderdoc-mcp"
 SERVER_VERSION = "0.1.0"
 VK_F12 = 0x7B
 KEYEVENTF_KEYUP = 0x0002
+_COMPAT_TOOLS = integration.load_compat_module() if integration is not None else None
+_EXTERNAL_PROXY_MODULE = integration.load_external_proxy_module() if integration is not None else None
+_EXTERNAL_PROXY = integration.create_external_proxy(_EXTERNAL_PROXY_MODULE) if integration is not None else None
 
 
 class _RdcStr(ctypes.Structure):
@@ -28,20 +90,8 @@ class _RdcStr(ctypes.Structure):
 _RDCSTR_FIXED_STATE = 1 << 63
 
 
-def _send_response(req_id: Any, result: Dict[str, Any]) -> None:
-    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": req_id, "result": result}) + "\n")
-    sys.stdout.flush()
-
-
-def _send_error(req_id: Any, code: int, message: str) -> None:
-    sys.stdout.write(
-        json.dumps({"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}) + "\n"
-    )
-    sys.stdout.flush()
-
-
 def _tool_definitions() -> List[Dict[str, Any]]:
-    return [
+    tools = [
         {
             "name": "capture_game",
             "description": "Capture a game with RenderDoc (launch new process or attach to an existing process) and auto-trigger a frame.",
@@ -348,7 +398,57 @@ def _tool_definitions() -> List[Dict[str, Any]]:
                 "additionalProperties": False,
             },
         },
+        {
+            "name": "get_event_state",
+            "description": "Get one-call state summary for an event (shader/resources/hotspot stats).",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rdc_path": {"type": "string", "description": "Absolute path to .rdc file."},
+                    "event_id": {"type": "integer", "description": "Target eventId."},
+                    "renderdoc_dir": {
+                        "type": "string",
+                        "description": "Directory containing qrenderdoc.exe. Defaults to script parent root.",
+                    },
+                    "save_root_dir": {
+                        "type": "string",
+                        "description": "Root directory for saved artifacts. Default: Desktop\\\\RENDERDOC-MCP-SAVE",
+                    },
+                },
+                "required": ["rdc_path", "event_id"],
+                "additionalProperties": False,
+            },
+        },
+        {
+            "name": "compare_events",
+            "description": "Compare two events in one capture and report differences in shaders/resources/perf.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "rdc_path": {"type": "string", "description": "Absolute path to .rdc file."},
+                    "event_a": {"type": "integer", "description": "Event A id."},
+                    "event_b": {"type": "integer", "description": "Event B id."},
+                    "renderdoc_dir": {
+                        "type": "string",
+                        "description": "Directory containing qrenderdoc.exe. Defaults to script parent root.",
+                    },
+                    "save_root_dir": {
+                        "type": "string",
+                        "description": "Root directory for saved artifacts. Default: Desktop\\\\RENDERDOC-MCP-SAVE",
+                    },
+                },
+                "required": ["rdc_path", "event_a", "event_b"],
+                "additionalProperties": False,
+            },
+        },
     ]
+    if integration is None:
+        return tools
+    return integration.merge_tool_definitions(
+        base_tools=tools,
+        compat_module=_COMPAT_TOOLS,
+        external_proxy=_EXTERNAL_PROXY,
+    )
 
 
 def _normalize_game_args(game_args: Any) -> List[str]:
@@ -739,7 +839,7 @@ def _build_texture_lookup(result: Dict[str, Any], top_n: int) -> List[Dict[str, 
             event_id = 0
         for sampled in row.get("psSampledResources", []) or []:
             rid = str(sampled.get("resourceId", ""))
-            if not rid:
+            if not rid or rid in ("0", "ResourceId::0"):
                 continue
             one = lookup.setdefault(
                 rid,
@@ -756,7 +856,7 @@ def _build_texture_lookup(result: Dict[str, Any], top_n: int) -> List[Dict[str, 
             one["maxGpuDuration_us"] = max(one["maxGpuDuration_us"], duration_by_event.get(event_id, 0.0))
         for out in row.get("outputTargets", []) or []:
             rid = str(out.get("resourceId", ""))
-            if not rid:
+            if not rid or rid in ("0", "ResourceId::0"):
                 continue
             one = lookup.setdefault(
                 rid,
@@ -799,11 +899,324 @@ def _build_texture_lookup(result: Dict[str, Any], top_n: int) -> List[Dict[str, 
     return rows[: max(top_n * 4, top_n)]
 
 
-def _render_analysis_html(result: Dict[str, Any], texture_lookup: List[Dict[str, Any]]) -> str:
+def _write_report_helpers(
+    *,
+    analysis_dir: Path,
+    rdc_path: Path,
+    qrenderdoc: Path,
+    hotspots: List[Dict[str, Any]],
+) -> Dict[str, Any]:
+    helpers: Dict[str, Any] = {
+        "open_capture_bat": None,
+        "jump_bats": [],
+        "runner_url": None,
+        "runner_token": None,
+        "generic_jump_script": None,
+    }
+
+    open_bat = analysis_dir / "open_capture.bat"
+    if qrenderdoc.exists():
+        open_bat.write_text(
+            f'@echo off\r\nstart "" "{qrenderdoc}" "{rdc_path}"\r\n',
+            encoding="utf-8",
+        )
+    else:
+        open_bat.write_text(
+            f'@echo off\r\nstart "" "{rdc_path}"\r\n',
+            encoding="utf-8",
+        )
+    helpers["open_capture_bat"] = open_bat.name
+
+    qrenderdoc_lit = repr(str(qrenderdoc))
+    rdc_path_lit = repr(str(rdc_path))
+    rdc_stem_lit = repr(str(rdc_path.stem).lower())
+    generic_jump_py = analysis_dir / "jump_to_event.py"
+    jump_code = f"""import json
+import os
+import subprocess
+import sys
+import tempfile
+import time
+import traceback
+from pathlib import Path
+
+qrenderdoc = Path({qrenderdoc_lit})
+rdc_path = Path({rdc_path_lit})
+if len(sys.argv) < 2:
+    raise SystemExit("missing event_id")
+event_id = int(sys.argv[1])
+
+
+def _emit(obj):
+    print(json.dumps(obj, ensure_ascii=False))
+
+
+def _has_qrenderdoc_running():
+    try:
+        p = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq qrenderdoc.exe"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        out = (p.stdout or "")
+        return "qrenderdoc.exe" in out.lower()
+    except Exception:
+        return False
+
+
+def _active_titles() -> str:
+    try:
+        p = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-Command",
+                "(Get-Process qrenderdoc -ErrorAction SilentlyContinue | "
+                "Where-Object {{$_.MainWindowTitle}} | "
+                "Select-Object -ExpandProperty MainWindowTitle) -join '||'",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=3,
+            check=False,
+        )
+        return (p.stdout or "").strip().lower()
+    except Exception:
+        return ""
+
+
+def _make_ui_script(target_rdc: str, target_event: int, result_path: str) -> str:
+    cfg = {{"rdc_path": target_rdc, "event_id": int(target_event), "result_path": result_path}}
+    cfg_json = json.dumps(cfg, ensure_ascii=True)
+    return (
+        "import json, os, time, traceback\\n"
+        "cfg = json.loads(" + repr(cfg_json) + ")\\n"
+        "rdc_path = os.path.abspath(cfg['rdc_path'])\\n"
+        "event_id = int(cfg['event_id'])\\n"
+        "result_path = cfg['result_path']\\n"
+        "res = {{'ok': False, 'event': event_id, 'jumped': 0, 'error': ''}}\\n"
+        "try:\\n"
+        "    import renderdoc as rd\\n"
+        "    ctx = pyrenderdoc\\n"
+        "    def _norm(p):\\n"
+        "        return os.path.normcase(os.path.abspath(str(p))).replace('/', '\\\\\\\\')\\n"
+        "    cur = str(ctx.GetCaptureFilename() or '') if ctx.IsCaptureLoaded() else ''\\n"
+        "    if (not ctx.IsCaptureLoaded()) or (_norm(cur) != _norm(rdc_path)):\\n"
+        "        ctx.LoadCapture(rdc_path, rd.ReplayOptions(), rdc_path, False, True)\\n"
+        "        dl = time.time() + 45.0\\n"
+        "        while ctx.IsCaptureLoading() and time.time() < dl:\\n"
+        "            time.sleep(0.1)\\n"
+        "    first_a = ctx.GetFirstAction()\\n"
+        "    last_a = ctx.GetLastAction()\\n"
+        "    first_e = int(first_a.eventId) if first_a else 1\\n"
+        "    last_e = int(last_a.eventId) if last_a else event_id\\n"
+        "    target = max(first_e, min(event_id, last_e))\\n"
+        "    ctx.SetEventID([], target, target, True)\\n"
+        "    time.sleep(0.1)\\n"
+        "    try:\\n"
+        "        ctx.ShowTextureViewer()\\n"
+        "    except Exception:\\n"
+        "        pass\\n"
+        "    jumped = int(ctx.CurEvent())\\n"
+        "    res['jumped'] = jumped\\n"
+        "    res['ok'] = bool(jumped == target)\\n"
+        "except Exception:\\n"
+        "    res['error'] = traceback.format_exc()\\n"
+        "with open(result_path, 'w', encoding='utf-8') as f:\\n"
+        "    json.dump(res, f, ensure_ascii=False, indent=2)\\n"
+    )
+
+
+def _run_ui_jump(mode: str, pass_filename: bool):
+    run_dir = Path(tempfile.mkdtemp(prefix="renderdoc_mcp_jump_"))
+    script_path = run_dir / "jump.py"
+    result_path = run_dir / "jump_result.json"
+    script_path.write_text(_make_ui_script(str(rdc_path), int(event_id), str(result_path)), encoding="utf-8")
+    cmd = [str(qrenderdoc), "--ui-python", str(script_path)]
+    if pass_filename:
+        cmd.append(str(rdc_path))
+    subprocess.Popen(cmd, cwd=str(qrenderdoc.parent))
+    deadline = time.time() + 14.0
+    while time.time() < deadline:
+        if result_path.exists():
+            break
+        time.sleep(0.2)
+    if not result_path.exists():
+        return {{"ok": False, "mode": mode, "event": event_id, "error": "timeout_waiting_result"}}
+    try:
+        payload = json.loads(result_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {{"ok": False, "mode": mode, "event": event_id, "error": "bad_result_json"}}
+    payload["mode"] = mode
+    if "event" not in payload:
+        payload["event"] = event_id
+    return payload
+
+
+target_hint = {rdc_stem_lit}
+if _has_qrenderdoc_running():
+    titles = _active_titles()
+    same_capture_open = bool(target_hint and (target_hint in titles))
+    if same_capture_open:
+        reuse = _run_ui_jump("reuse_ui_python", pass_filename=False)
+        if reuse.get("ok"):
+            _emit(reuse)
+            raise SystemExit(0)
+        launch = _run_ui_jump("launch_ui_python_fallback", pass_filename=True)
+        _emit(launch)
+        raise SystemExit(0)
+    reuse = _run_ui_jump("reuse_ui_python", pass_filename=False)
+    if reuse.get("ok"):
+        _emit(reuse)
+        raise SystemExit(0)
+
+launch = _run_ui_jump("launch_ui_python", pass_filename=True)
+_emit(launch)
+"""
+    generic_jump_py.write_text(jump_code, encoding="utf-8")
+    helpers["generic_jump_script"] = generic_jump_py.name
+
+    # Local runner server: enables one-click execution from report opened via file://
+    seed = str(analysis_dir.resolve()) + "|runner_v17"
+    digest = hashlib.md5(seed.encode("utf-8")).hexdigest()
+    port = 38000 + (int(digest[:4], 16) % 1000)
+    token = digest[4:20]
+    runner_py = analysis_dir / "report_runner.py"
+    runner_code = f"""import argparse
+import json
+import os
+import sys
+import subprocess
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+parser = argparse.ArgumentParser()
+parser.add_argument("--port", type=int, required=True)
+parser.add_argument("--root", type=str, required=True)
+parser.add_argument("--token", type=str, required=True)
+args = parser.parse_args()
+
+ROOT = Path(args.root).resolve()
+TOKEN = args.token
+
+class H(BaseHTTPRequestHandler):
+    def _send(self, code, payload):
+        raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        if u.path == "/ping":
+            return self._send(200, {{"ok": True}})
+        q = parse_qs(u.query or "")
+        if (q.get("token", [""])[0] or "") != TOKEN:
+            return self._send(403, {{"ok": False, "error": "bad_token"}})
+        if u.path == "/run":
+            bat = (q.get("bat", [""])[0] or "").strip()
+            if not bat:
+                return self._send(400, {{"ok": False, "error": "missing_bat"}})
+            p = (ROOT / bat).resolve()
+            if not str(p).lower().endswith(".bat"):
+                return self._send(400, {{"ok": False, "error": "invalid_target"}})
+            if not str(p).startswith(str(ROOT)) or not p.exists():
+                return self._send(404, {{"ok": False, "error": "bat_not_found"}})
+            try:
+                subprocess.Popen(["cmd", "/c", "start", "", str(p)], cwd=str(ROOT), shell=False)
+                return self._send(200, {{"ok": True, "bat": bat}})
+            except Exception as e:
+                return self._send(500, {{"ok": False, "error": str(e)}})
+        if u.path == "/jump":
+            eid_raw = (q.get("event", [""])[0] or "").strip()
+            try:
+                eid = int(eid_raw)
+            except Exception:
+                return self._send(400, {{"ok": False, "error": "invalid_event"}})
+            if eid <= 0:
+                return self._send(400, {{"ok": False, "error": "invalid_event"}})
+            jp = (ROOT / "jump_to_event.py").resolve()
+            if not str(jp).startswith(str(ROOT)) or not jp.exists():
+                return self._send(404, {{"ok": False, "error": "jump_script_missing"}})
+            try:
+                cp = subprocess.run(
+                    [sys.executable, str(jp), str(eid)],
+                    cwd=str(ROOT),
+                    shell=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=85,
+                    check=False,
+                )
+                raw = (cp.stdout or "").strip()
+                line = raw.splitlines()[-1] if raw else ""
+                try:
+                    payload = json.loads(line) if line else {{"ok": False, "error": "empty_jump_result"}}
+                except Exception:
+                    payload = {{"ok": False, "error": "invalid_jump_result", "stdout": raw}}
+                if "event" not in payload:
+                    payload["event"] = eid
+                return self._send(200, payload)
+            except Exception as e:
+                return self._send(500, {{"ok": False, "error": str(e)}})
+        return self._send(404, {{"ok": False, "error": "not_found"}})
+
+    def log_message(self, *a):
+        return
+
+HTTPServer(("127.0.0.1", args.port), H).serve_forever()
+"""
+    runner_py.write_text(runner_code, encoding="utf-8")
+    try:
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        subprocess.Popen(
+            [sys.executable, str(runner_py), "--port", str(port), "--root", str(analysis_dir), "--token", token],
+            cwd=str(analysis_dir),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP,
+        )
+    except Exception:
+        pass
+    helpers["runner_url"] = f"http://127.0.0.1:{port}"
+    helpers["runner_token"] = token
+
+    for row in (hotspots or [])[:20]:
+        try:
+            eid = int(row.get("eventId", 0) or 0)
+        except Exception:
+            continue
+        if eid <= 0:
+            continue
+        bat_name = f"jump_event_{eid}.bat"
+        bat_path = analysis_dir / bat_name
+        bat_path.write_text(
+            f'@echo off\r\npython "{generic_jump_py}" {eid}\r\n',
+            encoding="utf-8",
+        )
+        helpers["jump_bats"].append({"eventId": eid, "bat": bat_name})
+
+    return helpers
+
+
+def _render_analysis_html(
+    result: Dict[str, Any],
+    texture_lookup: List[Dict[str, Any]],
+    helpers: Optional[Dict[str, Any]] = None,
+) -> str:
     flow = result.get("flow", {}) or {}
     hotspots = result.get("hotspots", {}).get("topByGpuDuration", []) or []
     traces = result.get("pipeline_trace", []) or []
     algorithms = result.get("algorithms", {}).get("hints", []) or []
+    textures_top = result.get("textures", {}).get("topByUsageCount", []) or []
 
     def _table(headers: List[str], rows: List[List[str]]) -> str:
         thead = "".join(f"<th>{escape(h)}</th>" for h in headers)
@@ -813,6 +1226,153 @@ def _render_analysis_html(result: Dict[str, Any], texture_lookup: List[Dict[str,
         tbody = "".join(body_rows) if body_rows else "<tr><td colspan='99'>No data</td></tr>"
         return f"<table><thead><tr>{thead}</tr></thead><tbody>{tbody}</tbody></table>"
 
+    jump_bats = (helpers or {}).get("jump_bats", []) or []
+
+    def _ev_btn(event_id: Any) -> str:
+        try:
+            eid = int(event_id)
+        except Exception:
+            return ""
+        return (
+            f"<button class='mini' onclick='jumpEvent({eid})'>"
+            f"一键跳转到事件 #{eid}</button>"
+        )
+
+    trace_event_ids = set()
+    for t in traces:
+        try:
+            trace_event_ids.add(int(t.get("eventId", -1)))
+        except Exception:
+            pass
+
+    top_hot = hotspots[:5]
+    top_hot_gpu = 0.0
+    for h in top_hot:
+        try:
+            top_hot_gpu += float(h.get("gpuDuration_us", 0.0) or 0.0)
+        except Exception:
+            pass
+
+    # Build evidence-first conclusions
+    conclusions: List[Dict[str, Any]] = []
+    if top_hot:
+        h0 = top_hot[0]
+        eid = int(h0.get("eventId", 0) or 0)
+        val = float(h0.get("gpuDuration_us", 0.0) or 0.0)
+        in_trace = eid in trace_event_ids
+        conclusions.append(
+            {
+                "title": "主要性能热点已定位",
+                "confidence": 0.95 if in_trace else 0.75,
+                "status": "rule_based",
+                "summary": f"当前最重事件是 event {eid}，GPU 时长约 {val:.3f} us。",
+                "evidence": [
+                    f"来源: hotspots.topByGpuDuration[0]",
+                    f"eventId={eid}, gpuDuration_us={val:.3f}",
+                    f"在 pipeline_trace 中{'已' if in_trace else '未'}找到该事件",
+                ],
+                "event": eid,
+            }
+        )
+
+    if len(top_hot) >= 2:
+        a = top_hot[0]
+        b = top_hot[1]
+        try:
+            va = float(a.get("gpuDuration_us", 0.0) or 0.0)
+            vb = float(b.get("gpuDuration_us", 0.0) or 0.0)
+            ratio = va / vb if vb > 1e-6 else 0.0
+            conclusions.append(
+                {
+                    "title": "热点集中度",
+                    "confidence": 0.9,
+                    "status": "rule_based",
+                    "summary": f"Top1/Top2 时长比约 {ratio:.2f}x，说明热点{'高度集中' if ratio >= 1.3 else '相对分散'}。",
+                    "evidence": [
+                        f"top1 event={a.get('eventId')} gpu={va:.3f}us",
+                        f"top2 event={b.get('eventId')} gpu={vb:.3f}us",
+                        "计算: top1/top2",
+                    ],
+                    "event": int(a.get("eventId", 0) or 0),
+                }
+            )
+        except Exception:
+            pass
+
+    if texture_lookup:
+        x0 = texture_lookup[0]
+        rid = str(x0.get("resourceId", ""))
+        max_gpu = float(x0.get("maxGpuDuration_us", 0.0) or 0.0)
+        hs = x0.get("hotspotEventIds", []) or []
+        conclusions.append(
+            {
+                "title": "关键资源关联热点",
+                "confidence": 0.88,
+                "status": "rule_based",
+                "summary": f"资源 {rid} 关联多个热点事件，最大关联时长约 {max_gpu:.3f} us。",
+                "evidence": [
+                    "来源: texture_lookup[0]",
+                    f"resourceId={rid}",
+                    f"hotspotEventIds={hs[:8]}",
+                    f"maxGpuDuration_us={max_gpu:.3f}",
+                ],
+                "event": int(hs[0]) if hs else None,
+            }
+        )
+
+    # Consistency checks for trust
+    checks: List[Dict[str, Any]] = []
+    checks.append(
+        {
+            "name": "hotspots 非空",
+            "ok": bool(hotspots),
+            "detail": f"count={len(hotspots)}",
+        }
+    )
+    checks.append(
+        {
+            "name": "pipeline_trace 非空",
+            "ok": bool(traces),
+            "detail": f"count={len(traces)}",
+        }
+    )
+    miss_in_trace = []
+    for h in hotspots[:10]:
+        try:
+            eid = int(h.get("eventId", -1))
+            if eid not in trace_event_ids:
+                miss_in_trace.append(eid)
+        except Exception:
+            pass
+    checks.append(
+        {
+            "name": "Top10 热点事件可在 trace 找到",
+            "ok": len(miss_in_trace) == 0,
+            "detail": "missing=" + (",".join(str(x) for x in miss_in_trace) if miss_in_trace else "none"),
+        }
+    )
+    bad_lookup = 0
+    for row in texture_lookup[:20]:
+        try:
+            if not str(row.get("resourceId", "")).strip():
+                bad_lookup += 1
+        except Exception:
+            bad_lookup += 1
+    checks.append(
+        {
+            "name": "texture_lookup 关键字段完整",
+            "ok": bad_lookup == 0,
+            "detail": f"invalid_rows={bad_lookup}",
+        }
+    )
+    check_ok = sum(1 for c in checks if c["ok"])
+    check_score = check_ok / max(len(checks), 1)
+
+    confidence_overall = 0.6
+    if conclusions:
+        confidence_overall = sum(float(c.get("confidence", 0.0)) for c in conclusions) / len(conclusions)
+    confidence_overall = round((confidence_overall * 0.7 + check_score * 0.3), 3)
+
     hotspot_rows = [
         [
             str(x.get("eventId", "")),
@@ -820,6 +1380,7 @@ def _render_analysis_html(result: Dict[str, Any], texture_lookup: List[Dict[str,
             str(x.get("numIndices", "")),
             str(x.get("numInstances", "")),
             str(x.get("name", "")),
+            "Yes" if int(x.get("eventId", -1) or -1) in trace_event_ids else "No",
         ]
         for x in hotspots
     ]
@@ -832,7 +1393,7 @@ def _render_analysis_html(result: Dict[str, Any], texture_lookup: List[Dict[str,
             str(x.get("format", "")),
             str(x.get("name", "")),
         ]
-        for x in (result.get("textures", {}).get("topByUsageCount", []) or [])
+        for x in textures_top
     ]
     lookup_rows = [
         [
@@ -859,12 +1420,47 @@ def _render_analysis_html(result: Dict[str, Any], texture_lookup: List[Dict[str,
             ]
         )
 
+    conclusion_cards = []
+    for c in conclusions:
+        evid = "".join(f"<li>{escape(str(e))}</li>" for e in (c.get("evidence") or []))
+        event_btn = _ev_btn(c.get("event")) if c.get("event") else ""
+        conclusion_cards.append(
+            "<div class='conclusion'>"
+            f"<div class='c-head'><b>{escape(str(c.get('title', '')))}</b>"
+            f"<span class='tag'>{escape(str(c.get('status', '')))}</span>"
+            f"<span class='conf'>confidence={float(c.get('confidence', 0.0)):.2f}</span></div>"
+            f"<div class='c-body'>{escape(str(c.get('summary', '')))}</div>"
+            f"<div class='c-actions'>{event_btn}</div>"
+            f"<ul>{evid}</ul>"
+            "</div>"
+        )
+    if not conclusion_cards:
+        conclusion_cards.append("<div class='conclusion'><b>未生成结论</b><div class='c-body'>数据不足，建议先确认 capture 是否完整。</div></div>")
+
+    check_rows = [[x["name"], "PASS" if x["ok"] else "FAIL", x["detail"]] for x in checks]
+    open_bat = (helpers or {}).get("open_capture_bat")
+    quick_items: List[str] = []
+    runner_url = str((helpers or {}).get("runner_url") or "")
+    runner_token = str((helpers or {}).get("runner_token") or "")
+    if open_bat:
+        quick_items.append(
+            f"<button class='mini' onclick='runAction({json.dumps(str(open_bat), ensure_ascii=False)})'>"
+            f"一键打开本地 RenderDoc</button>"
+        )
+    for jb in jump_bats[:10]:
+        eid = int(jb.get("eventId", 0))
+        quick_items.append(
+            f"<button class='mini' onclick='jumpEvent({eid})'>"
+            f"一键跳转到事件 #{eid}</button>"
+        )
+    quick_ops_html = "".join(f"<li>{x}</li>" for x in quick_items) or "<li>无可用快捷操作</li>"
+
     return f"""<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>RenderDoc MCP Analysis</title>
+  <title>RenderDoc MCP Evidence Report</title>
   <style>
     :root {{
       --bg: #f3f7fa;
@@ -889,43 +1485,123 @@ def _render_analysis_html(result: Dict[str, Any], texture_lookup: List[Dict[str,
     th, td {{ border-bottom: 1px solid #e8eef3; text-align: left; padding: 7px 6px; vertical-align: top; }}
     th {{ position: sticky; top: 0; background: #f7fbff; z-index: 1; }}
     ul {{ margin: 6px 0 0 18px; padding: 0; }}
+    .conclusion {{ border: 1px solid #dce7ef; border-radius: 10px; padding: 10px; margin-bottom: 10px; background: #fbfdff; }}
+    .c-head {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }}
+    .tag {{ font-size: 11px; color: #0f6674; background: #e6f4f6; border: 1px solid #cbe6ea; border-radius: 999px; padding: 2px 8px; }}
+    .conf {{ font-size: 11px; color: #29465c; background: #eef4fb; border: 1px solid #d7e3f0; border-radius: 999px; padding: 2px 8px; }}
+    .c-body {{ color: #163245; font-size: 13px; }}
+    .c-actions {{ margin-top: 6px; }}
+    .mini {{ border: 1px solid #bfd2e2; background: #f7fbff; color: #114b66; border-radius: 6px; padding: 3px 8px; font-size: 11px; cursor: pointer; }}
+    .score {{ font-size: 22px; font-weight: 700; color: #0b6d7a; }}
+    .source-note {{ font-size: 12px; color: #4d6475; }}
   </style>
+  <script>
+    function runAction(path) {{
+      try {{
+        const url = {json.dumps(runner_url, ensure_ascii=False)};
+        const token = {json.dumps(runner_token, ensure_ascii=False)};
+        if (!url || !token) {{
+          throw new Error("runner_unavailable");
+        }}
+        fetch(url + "/run?token=" + encodeURIComponent(token) + "&bat=" + encodeURIComponent(path), {{
+          method: "GET",
+          mode: "cors"
+        }}).then(r => r.json()).then(j => {{
+          if (!j.ok) {{
+            alert("自动执行失败: " + JSON.stringify(j));
+          }}
+        }}).catch(() => {{
+          alert("自动执行失败");
+        }});
+      }} catch (e) {{
+        alert("自动执行失败");
+      }}
+    }}
+    function jumpEvent(eventId) {{
+      try {{
+        const eid = Number(eventId);
+        if (!Number.isFinite(eid) || eid <= 0) {{
+          alert("无效事件ID");
+          return;
+        }}
+        const url = {json.dumps(runner_url, ensure_ascii=False)};
+        const token = {json.dumps(runner_token, ensure_ascii=False)};
+        if (!url || !token) {{
+          throw new Error("runner_unavailable");
+        }}
+        fetch(url + "/jump?token=" + encodeURIComponent(token) + "&event=" + encodeURIComponent(String(eid)), {{
+          method: "GET",
+          mode: "cors"
+        }}).then(r => r.json()).then(j => {{
+          if (!j.ok) {{
+            alert("事件跳转失败: " + JSON.stringify(j));
+            return;
+          }}
+          console.log("事件跳转回执:", j);
+        }}).catch(() => {{
+          alert("事件跳转失败");
+        }});
+      }} catch (e) {{
+        alert("事件跳转失败");
+      }}
+    }}
+  </script>
 </head>
 <body>
   <div class="wrap">
     <div class="hero">
-      <h1>RenderDoc MCP Analysis</h1>
+      <h1>RenderDoc MCP 证据报告</h1>
       <div class="muted">{escape(str(result.get("rdc_path", "")))}</div>
       <div class="grid">
         <div class="kpi">Pipeline<b>{escape(str(result.get("pipeline", "")))}</b></div>
         <div class="kpi">Events<b>{escape(str(flow.get("eventCount", 0)))}</b></div>
         <div class="kpi">Draws<b>{escape(str(flow.get("drawCount", 0)))}</b></div>
         <div class="kpi">Begin/EndPass<b>{escape(str(flow.get("beginPassCount", 0)))}/{escape(str(flow.get("endPassCount", 0)))}</b></div>
+        <div class="kpi">Top5 Hotspot 累计(us)<b>{escape(str(round(top_hot_gpu, 3)))}</b></div>
+        <div class="kpi">整体可信度<b class="score">{confidence_overall:.2f}</b></div>
+      </div>
+      <div class="source-note">
+        数据来源: RenderDoc API 原始字段（flow/hotspots/pipeline_trace/texture_lookup）。每条结论下都附可追溯证据。
       </div>
     </div>
 
     <div class="card">
-      <h2>Algorithm Hints</h2>
+      <h2>结论（可追溯）</h2>
+      {"".join(conclusion_cards)}
+    </div>
+
+    <div class="card">
+      <h2>快速操作</h2>
+      <ul>{quick_ops_html}</ul>
+    </div>
+
+    <div class="card">
+      <h2>一致性检查</h2>
+      {_table(["检查项", "结果", "详情"], check_rows)}
+    </div>
+
+    <div class="card">
+      <h2>算法提示（辅助）</h2>
       <ul>{"".join(f"<li>{escape(str(x))}</li>" for x in algorithms) or "<li>No hint</li>"}</ul>
     </div>
 
     <div class="card">
-      <h2>Top GPU Hotspots</h2>
-      {_table(["eventId", "gpuDuration_us", "numIndices", "numInstances", "name"], hotspot_rows)}
+      <h2>Top GPU Hotspots（含可追溯标记）</h2>
+      {_table(["eventId", "gpuDuration_us", "numIndices", "numInstances", "name", "in_trace"], hotspot_rows)}
     </div>
 
     <div class="card">
-      <h2>Top Texture Usage</h2>
+      <h2>Top Texture Usage（仅决策相关）</h2>
       {_table(["resourceId", "usageCount", "width", "height", "format", "name"], texture_rows)}
     </div>
 
     <div class="card">
-      <h2>Texture To Hotspot Mapping</h2>
+      <h2>资源-热点映射（证据）</h2>
       {_table(["resourceId", "maxGpuDuration_us", "hotspotEventIds", "sampledByEventIds", "outputByEventIds", "name"], lookup_rows)}
     </div>
 
     <div class="card">
-      <h2>Pipeline Trace (Hot Events)</h2>
+      <h2>Pipeline Trace（热点事件上下文）</h2>
       {_table(["eventId", "vsShaderId", "psShaderId", "psSampledResources", "outputTargets"], trace_rows)}
     </div>
   </div>
@@ -1327,8 +2003,20 @@ if persist_output_path:
             proc.kill()
 
     if result_path.exists():
-        payload = json.loads(result_path.read_text(encoding="utf-8"))
-        result.update(payload)
+        payload = None
+        decode_err = None
+        for _ in range(25):
+            try:
+                payload = json.loads(result_path.read_text(encoding="utf-8"))
+                decode_err = None
+                break
+            except Exception as e:
+                decode_err = e
+                time.sleep(0.12)
+        if payload is not None:
+            result.update(payload)
+        else:
+            result["errors"].append(f"analyze result json parse failed: {decode_err}")
     else:
         result["errors"].append("analyze result file not produced")
 
@@ -1375,7 +2063,13 @@ if persist_output_path:
         artifacts["errors.json"].write_text(
             json.dumps(result.get("errors", []), ensure_ascii=False, indent=2), encoding="utf-8"
         )
-        html = _render_analysis_html(result=result, texture_lookup=texture_lookup)
+        helpers = _write_report_helpers(
+            analysis_dir=analysis_dir,
+            rdc_path=rdc_path,
+            qrenderdoc=qrenderdoc,
+            hotspots=result.get("hotspots", {}).get("topByGpuDuration", []) or [],
+        )
+        html = _render_analysis_html(result=result, texture_lookup=texture_lookup, helpers=helpers)
         artifacts["report.html"].write_text(html, encoding="utf-8")
 
         result["analysis_json"] = str(artifacts["analysis.full.json"])
@@ -2323,72 +3017,226 @@ def _analyze_event(args: Dict[str, Any]) -> Dict[str, Any]:
     )
 
 
-def _text_result(data: Dict[str, Any], is_error: bool = False) -> Dict[str, Any]:
-    return {
-        "content": [{"type": "text", "text": json.dumps(data, ensure_ascii=False, indent=2)}],
-        "isError": is_error,
-    }
+def _collect_event_from_analysis(analysis: Dict[str, Any], event_id: int) -> Dict[str, Any]:
+    eid = int(event_id)
+    hotspots = analysis.get("hotspots", {}).get("topByGpuDuration", []) or []
+    trace_rows = analysis.get("pipeline_trace", []) or []
+    texture_lookup = analysis.get("texture_lookup", []) or []
 
-
-def main() -> None:
-    for raw in sys.stdin:
-        raw = raw.strip()
-        if not raw:
-            continue
+    hotspot = None
+    rank = None
+    for i, row in enumerate(hotspots, start=1):
         try:
-            req = json.loads(raw)
+            if int(row.get("eventId", -1)) == eid:
+                hotspot = row
+                rank = i
+                break
         except Exception:
             continue
 
-        method = req.get("method")
-        req_id = req.get("id")
-        params = req.get("params", {})
-
-        # notifications don't require a response
-        wants_response = req_id is not None
-
+    trace = None
+    for row in trace_rows:
         try:
-            if method == "initialize":
-                result = {
-                    "protocolVersion": params.get("protocolVersion", "2024-11-05"),
-                    "capabilities": {"tools": {}},
-                    "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            if int(row.get("eventId", -1)) == eid:
+                trace = row
+                break
+        except Exception:
+            continue
+
+    related = []
+    for row in texture_lookup:
+        evs = row.get("hotspotEventIds", []) or []
+        try:
+            if eid in [int(x) for x in evs]:
+                related.append(row)
+        except Exception:
+            continue
+
+    return {
+        "eventId": eid,
+        "hotspotRank": rank,
+        "hotspot": hotspot,
+        "trace": trace,
+        "relatedResources": related,
+    }
+
+
+def _get_event_state(args: Dict[str, Any]) -> Dict[str, Any]:
+    rdc_path_arg = args.get("rdc_path")
+    if not rdc_path_arg:
+        raise ValueError("rdc_path is required")
+    event_id_arg = args.get("event_id")
+    if event_id_arg is None:
+        raise ValueError("event_id is required")
+
+    rdc_path = Path(str(rdc_path_arg)).expanduser().resolve()
+    event_id = int(event_id_arg)
+    save_root_dir_arg = args.get("save_root_dir")
+    save_root_dir = (
+        Path(str(save_root_dir_arg)).expanduser().resolve()
+        if save_root_dir_arg
+        else _default_analysis_save_root()
+    )
+    _renderdoccmd, qrenderdoc = _resolve_renderdoc_paths(args.get("renderdoc_dir"))
+    analysis = _analyze_rdc_with_qrenderdoc(
+        qrenderdoc=qrenderdoc,
+        rdc_path=rdc_path,
+        top_n=96,
+        save_json=True,
+        save_root_dir=save_root_dir,
+        open_report=False,
+    )
+    state = _collect_event_from_analysis(analysis, event_id=event_id)
+    if state.get("hotspot") is None and state.get("trace") is None:
+        raise ValueError(
+            f"event {event_id} not found in hotspot/pipeline_trace window; increase analyzer coverage if needed"
+        )
+    return {
+        "rdc_path": str(rdc_path),
+        "event_state": state,
+        "analysis_dir": analysis.get("analysis_dir"),
+    }
+
+
+def _compare_events(args: Dict[str, Any]) -> Dict[str, Any]:
+    rdc_path_arg = args.get("rdc_path")
+    if not rdc_path_arg:
+        raise ValueError("rdc_path is required")
+    if args.get("event_a") is None or args.get("event_b") is None:
+        raise ValueError("event_a and event_b are required")
+
+    rdc_path = Path(str(rdc_path_arg)).expanduser().resolve()
+    event_a = int(args.get("event_a"))
+    event_b = int(args.get("event_b"))
+    save_root_dir_arg = args.get("save_root_dir")
+    save_root_dir = (
+        Path(str(save_root_dir_arg)).expanduser().resolve()
+        if save_root_dir_arg
+        else _default_analysis_save_root()
+    )
+    _renderdoccmd, qrenderdoc = _resolve_renderdoc_paths(args.get("renderdoc_dir"))
+    analysis = _analyze_rdc_with_qrenderdoc(
+        qrenderdoc=qrenderdoc,
+        rdc_path=rdc_path,
+        top_n=128,
+        save_json=True,
+        save_root_dir=save_root_dir,
+        open_report=False,
+    )
+    a = _collect_event_from_analysis(analysis, event_id=event_a)
+    b = _collect_event_from_analysis(analysis, event_id=event_b)
+
+    ta = a.get("trace") or {}
+    tb = b.get("trace") or {}
+    a_vs = (ta.get("vs") or {}).get("id")
+    b_vs = (tb.get("vs") or {}).get("id")
+    a_ps = (ta.get("ps") or {}).get("id")
+    b_ps = (tb.get("ps") or {}).get("id")
+
+    a_inputs = sorted(set((x.get("resourceId") for x in (ta.get("psSampledResources") or []) if x.get("resourceId"))))
+    b_inputs = sorted(set((x.get("resourceId") for x in (tb.get("psSampledResources") or []) if x.get("resourceId"))))
+    a_outputs = sorted(set((x.get("resourceId") for x in (ta.get("outputTargets") or []) if x.get("resourceId"))))
+    b_outputs = sorted(set((x.get("resourceId") for x in (tb.get("outputTargets") or []) if x.get("resourceId"))))
+
+    ah = a.get("hotspot") or {}
+    bh = b.get("hotspot") or {}
+    a_gpu = float(ah.get("gpuDuration_us", 0.0) or 0.0)
+    b_gpu = float(bh.get("gpuDuration_us", 0.0) or 0.0)
+
+    return {
+        "rdc_path": str(rdc_path),
+        "event_a": a,
+        "event_b": b,
+        "diff": {
+            "same_vs_shader": a_vs == b_vs and bool(a_vs),
+            "same_ps_shader": a_ps == b_ps and bool(a_ps),
+            "vs_shader_a": a_vs,
+            "vs_shader_b": b_vs,
+            "ps_shader_a": a_ps,
+            "ps_shader_b": b_ps,
+            "inputs_only_in_a": [x for x in a_inputs if x not in b_inputs],
+            "inputs_only_in_b": [x for x in b_inputs if x not in a_inputs],
+            "outputs_only_in_a": [x for x in a_outputs if x not in b_outputs],
+            "outputs_only_in_b": [x for x in b_outputs if x not in a_outputs],
+            "gpuDuration_us_a": a_gpu,
+            "gpuDuration_us_b": b_gpu,
+            "gpuDuration_delta_us": round(a_gpu - b_gpu, 3),
+        },
+        "analysis_dir": analysis.get("analysis_dir"),
+    }
+
+
+def _build_tool_handlers() -> Dict[str, Any]:
+    handlers: Dict[str, Any] = {}
+    if capture_entry_tools is not None:
+        try:
+            handlers.update(capture_entry_tools.build_handlers(capture_game_fn=_capture_game))
+        except Exception:
+            handlers["capture_game"] = _capture_game
+    else:
+        handlers["capture_game"] = _capture_game
+    if analysis_entry_tools is not None:
+        try:
+            handlers.update(
+                analysis_entry_tools.build_handlers(
+                    analyze_rdc_with_qrenderdoc=_analyze_rdc_with_qrenderdoc,
+                    focus_rdc_event_with_qrenderdoc=_focus_rdc_event_with_qrenderdoc,
+                    analyze_event_with_qrenderdoc=_analyze_event_with_qrenderdoc,
+                    default_analysis_save_root=_default_analysis_save_root,
+                    resolve_renderdoc_paths=_resolve_renderdoc_paths,
+                    build_focus_event_context=_build_focus_event_context,
+                    write_focus_context_files=_write_focus_context_files,
+                )
+            )
+        except Exception:
+            handlers.update(
+                {
+                    "analyze_rdc": _analyze_rdc,
+                    "focus_rdc_event": _focus_rdc_event,
+                    "analyze_event": _analyze_event,
+                    "get_event_state": _get_event_state,
+                    "compare_events": _compare_events,
                 }
-                if wants_response:
-                    _send_response(req_id, result)
-            elif method == "tools/list":
-                if wants_response:
-                    _send_response(req_id, {"tools": _tool_definitions()})
-            elif method == "tools/call":
-                name = params.get("name")
-                arguments = params.get("arguments", {})
-                if name == "capture_game":
-                    data = _capture_game(arguments)
-                elif name == "analyze_rdc":
-                    data = _analyze_rdc(arguments)
-                elif name == "focus_rdc_event":
-                    data = _focus_rdc_event(arguments)
-                elif name == "analyze_event":
-                    data = _analyze_event(arguments)
-                else:
-                    raise ValueError(f"Unknown tool: {name}")
-                if wants_response:
-                    _send_response(req_id, _text_result(data, is_error=False))
-            elif method in ("notifications/initialized", "ping"):
-                if wants_response:
-                    _send_response(req_id, {})
-            elif method in ("resources/list", "prompts/list"):
-                if wants_response:
-                    _send_response(req_id, {"resources": []} if method == "resources/list" else {"prompts": []})
-            else:
-                if wants_response:
-                    _send_error(req_id, -32601, f"Method not found: {method}")
-        except Exception as exc:
-            if wants_response:
-                if method == "tools/call":
-                    _send_response(req_id, _text_result({"error": str(exc)}, is_error=True))
-                else:
-                    _send_error(req_id, -32000, str(exc))
+            )
+    else:
+        handlers.update(
+            {
+                "analyze_rdc": _analyze_rdc,
+                "focus_rdc_event": _focus_rdc_event,
+                "analyze_event": _analyze_event,
+                "get_event_state": _get_event_state,
+                "compare_events": _compare_events,
+            }
+        )
+    if _COMPAT_TOOLS is not None:
+        try:
+            handlers.update(
+                _COMPAT_TOOLS.build_handlers(
+                    analyze_rdc=_analyze_rdc,
+                    get_event_state=_get_event_state,
+                    compare_events=_compare_events,
+                    resolve_renderdoc_paths=_resolve_renderdoc_paths,
+                )
+            )
+        except Exception:
+            pass
+    return handlers
+
+
+def main() -> None:
+    if server_runtime is None:
+        raise RuntimeError("server_runtime module unavailable")
+    server_runtime.run_stdio_server(
+        server_name=SERVER_NAME,
+        server_version=SERVER_VERSION,
+        tool_definitions_fn=_tool_definitions,
+        build_handlers_fn=_build_tool_handlers,
+        external_call_fn=(
+            (lambda name, arguments: _EXTERNAL_PROXY.call_tool(name, arguments))
+            if _EXTERNAL_PROXY is not None
+            else None
+        ),
+    )
 
 
 if __name__ == "__main__":

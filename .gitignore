@@ -2,3 +2,4 @@ captures/
 __pycache__/
 mcp/__pycache__/
 *.pyc
+_chm_extract/

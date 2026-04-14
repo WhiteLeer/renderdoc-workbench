@@ -8,6 +8,21 @@
 - 工具名：`analyze_rdc`
 - 工具名：`focus_rdc_event`
 - 工具名：`analyze_event`
+- 工具名：`get_event_state`
+- 工具名：`compare_events`
+- 工具名：`open_capture`
+- 工具名：`close_capture`
+- 工具名：`get_capture_info`
+- 工具名：`get_frame_overview`
+- 工具名：`get_pass_timing`
+- 工具名：`get_draw_call_state`
+- 工具名：`diff_draw_calls`
+- 工具名：`save_texture`
+- 工具名：`save_render_target`
+- 工具名：`export_draw_textures`
+- 工具名：`export_mesh`
+
+另外已接入“外部工具代理层”：当本地不存在某个工具时，会自动转发到外部 `renderdoc-mcp`（Linkingooo/PyPI 工具集）执行。
 
 ## 模式
 
@@ -158,6 +173,53 @@
 说明（稳定性模式）：
 - 为避免 qrenderdoc 崩溃弹窗循环，`analyze_event` 当前优先走稳定分析链路（会返回资源映射与优化建议）。
 - `images\\` 目录会创建，但贴图导出暂时禁用并在结果里标注 `stability mode`。
+
+`get_event_state`（单事件一键状态总览）：
+
+```json
+{
+  "rdc_path": "C:\\Users\\wepie\\Desktop\\RenderDoc-mcp\\captures\\sample.rdc",
+  "event_id": 429
+}
+```
+
+返回：热点排名、GPU时长、VS/PS、采样输入资源、输出目标、关联资源映射。
+
+`compare_events`（两个事件差异分析）：
+
+```json
+{
+  "rdc_path": "C:\\Users\\wepie\\Desktop\\RenderDoc-mcp\\captures\\sample.rdc",
+  "event_a": 429,
+  "event_b": 568
+}
+```
+
+返回：shader 是否一致、输入/输出资源差异、GPU 时长差值（`gpuDuration_delta_us`）。
+
+## 外部兼容工具（已模块化）
+
+为兼容 `renderdoc-mcp`（PyPI / Linkingooo）常见工作流，新增一组 session 工具：
+
+1. 先 `open_capture({"filepath":"...rdc"})`
+2. 再调用 `get_capture_info` / `get_frame_overview` / `get_pass_timing`
+3. 事件级调用：`get_draw_call_state` / `diff_draw_calls`
+4. 导出类调用：`save_texture` / `save_render_target` / `export_draw_textures` / `export_mesh`
+5. 结束时 `close_capture`
+
+说明：
+- 这组兼容工具由新模块 `mcp/compat_tools.py` 承载。
+- 导出类工具内部走 `qrenderdoc --python`，不依赖你当前 Python 环境直接 import `renderdoc`。
+- 外部全量工具代理模块：`mcp/external_tools_proxy.py`。
+
+当前服务结构（重构中，已落地第一阶段）：
+- `mcp/renderdoc_mcp_server.py`：本地核心业务工具实现（capture/analyze/focus）
+- `mcp/analysis_entry_tools.py`：analyze/focus/event/compare 入口处理器（已拆分）
+- `mcp/capture_entry_tools.py`：capture_game 入口处理器（已拆分）
+- `mcp/compat_tools.py`：兼容工具层（open_capture/get_pass_timing 等）
+- `mcp/external_tools_proxy.py`：外部 MCP 工具代理（自动并入 tools/list）
+- `mcp/integration.py`：可选模块加载与工具定义合并
+- `mcp/server_runtime.py`：JSON-RPC stdio 协议主循环
 
 ## 提示
 
